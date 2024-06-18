@@ -17,44 +17,54 @@ unsigned short int calculate_checksum(void *data, unsigned int bytes);
 
 
 
-// Creating a RUDP socket and creating a handshake between two peers
+/**
+ * @brief A function to create a new RUDP connection.
+ * @param receiver_addr The address of the receiver.
+ * @param sender_addr The address of the sender.
+ * @param sockfd The socket file descriptor.
+ * @return A pointer to the newly created RUDPConnection.
+ * @note This function handles the three-way handshake for establishing a connection.
+ * @note It sends a SYN packet, waits for a SYN-ACK packet, and then sends an ACK packet.
+ * @note If any error occurs during the handshake, it prints an error message and exits.
+ */
 RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_in *sender_addr, int sockfd)
-{
-    RUDPConnection *connection = (RUDPConnection *)malloc(sizeof(RUDPConnection));
+{   
+    
+    RUDPConnection *connection = (RUDPConnection *)malloc(sizeof(RUDPConnection));// Allocate memory for the RUDPConnection
     if (connection == NULL)
     {
         perror("Failed to allocate memory for RUDPConnection");
         exit(1);
     }
 
-    connection->sockfd = sockfd;
-    connection->receiver_addr = *receiver_addr;
+    connection->sockfd = sockfd;// Store the socket file descriptor
+    connection->receiver_addr = *receiver_addr;// Store the receiver's address
     if (sender_addr != NULL)
     {
         connection->sender_addr = *sender_addr;
     }
-    connection->next_sequence_number = 1;
+    connection->next_sequence_number = 1;// Set the next sequence number to 1
 
     if (sender_addr == NULL)
     {
         // Sender side
         connection->sender_addr = *receiver_addr; // Store the receiver's address as the sender's address
 
-        RUDPPacket syn_packet;
-        syn_packet.length = htons(RUDP_HEADER_SIZE);
-        syn_packet.header.checksum = 0;
-        syn_packet.header.flags.SYN = 1;
-        syn_packet.header.checksum = htons(calculate_checksum((char *)&syn_packet, sizeof(RUDPPacket)));
-        printf("Sending SYN packet with checksum: %u\n", ntohs(syn_packet.header.checksum));
+        RUDPPacket syn_packet;// Create a SYN packet
+        syn_packet.length = htons(RUDP_HEADER_SIZE);// Set the length of the packet
+        syn_packet.header.checksum = 0;// Set the checksum to 0
+        syn_packet.header.flags.SYN = 1;// Set the SYN flag
+        syn_packet.header.checksum = htons(calculate_checksum((char *)&syn_packet, sizeof(RUDPPacket)));// Calculate the checksum
+        printf("Sending SYN packet with checksum: %u\n", ntohs(syn_packet.header.checksum));// Print the checksum
 
-        if (sendto(sockfd, &syn_packet, RUDP_HEADER_SIZE, 0, (struct sockaddr *)receiver_addr, sizeof(struct sockaddr_in)) < 0)
+        if (sendto(sockfd, &syn_packet, RUDP_HEADER_SIZE, 0, (struct sockaddr *)receiver_addr, sizeof(struct sockaddr_in)) < 0)// Send the SYN packet
         {
             perror("Error sending SYN packet");
             free(connection);
             exit(1);
         }
 
-        RUDPPacket synack_packet;
+        RUDPPacket synack_packet;// Create a SYN-ACK packet
         struct sockaddr_in synack_sender_addr;
         socklen_t synack_sender_addr_len = sizeof(synack_sender_addr);
         while (1)
@@ -76,7 +86,7 @@ RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_i
             }
         }
 
-        RUDPPacket ack_packet;
+        RUDPPacket ack_packet;// Create an ACK packet
         ack_packet.length = htons(RUDP_HEADER_SIZE);
         ack_packet.header.checksum = 0;
         ack_packet.header.flags.ACK = 1;
@@ -93,10 +103,10 @@ RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_i
     else
     {
         // Receiver side
-        RUDPPacket syn_packet;
+        RUDPPacket syn_packet;// Create a SYN packet
         struct sockaddr_in syn_sender_addr;
         socklen_t syn_sender_addr_len = sizeof(syn_sender_addr);
-        while (1)
+        while (1)// Wait for a SYN packet
         {
             if (recvfrom(sockfd, &syn_packet, sizeof(RUDPPacket), 0, (struct sockaddr *)&syn_sender_addr, &syn_sender_addr_len) < 0)
             {
@@ -116,7 +126,7 @@ RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_i
             }
         }
 
-        RUDPPacket synack_packet;
+        RUDPPacket synack_packet;// Create a SYN-ACK packet
         synack_packet.length = htons(RUDP_HEADER_SIZE);
         synack_packet.header.checksum = 0;
         synack_packet.header.flags.SYN = 1;
@@ -131,8 +141,8 @@ RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_i
             exit(1);
         }
 
-        RUDPPacket ack_packet;
-        while (1)
+        RUDPPacket ack_packet;// Create an ACK packet
+        while (1)// Wait for an ACK packet
         {
             if (recvfrom(sockfd, &ack_packet, sizeof(RUDPPacket), 0, NULL, NULL) < 0)
             {
@@ -154,7 +164,20 @@ RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_i
 
     return connection;
 }
-
+/**
+ * @brief Sends a data packet over a RUDP connection.
+ * 
+ * This function sends a data packet over a Reliable UDP (RUDP) connection. It handles
+ * the creation of the packet, setting the sequence number, calculating the checksum,
+ * and managing retransmissions in case of packet loss or errors.
+ * 
+ * @param connection A pointer to the RUDPConnection structure representing the connection.
+ * @param buffer A pointer to the data buffer to be sent.
+ * @param buffer_size The size of the data buffer in bytes.
+ * @param sender_addr A pointer to the sockaddr_in structure representing the sender's address.
+ * 
+ * @return The number of bytes sent on success, or -1 on error.
+ */
 int rudp_send(RUDPConnection *connection, char *buffer, int buffer_size, struct sockaddr_in *sender_addr)
 {
     RUDPPacket packet;
@@ -216,7 +239,7 @@ int rudp_send(RUDPConnection *connection, char *buffer, int buffer_size, struct 
                 return -1;
             }
         }
-        else
+        else// if the packet is valid
         {
             if (ack_packet.header.sequence_number == connection->next_sequence_number && ack_packet.header.flags.ACK == 1)
             {
@@ -245,7 +268,21 @@ int rudp_send(RUDPConnection *connection, char *buffer, int buffer_size, struct 
     connection->next_sequence_number++;
     return bytes_sent;
 }
-
+/**
+ * @brief Receives a data packet over a RUDP connection.
+ * 
+ * This function waits for a data packet to be received over a Reliable UDP (RUDP) connection.
+ * It verifies the checksum and sequence number of the received packet, and sends a NACK packet
+ * if the packet is invalid. If the packet is valid, it sends an ACK packet and copies the data
+ * to the provided buffer.
+ * 
+ * @param connection A pointer to the RUDPConnection structure representing the connection.
+ * @param buffer A pointer to the buffer where the received data will be stored.
+ * @param buffer_size The size of the buffer in bytes.
+ * @param sender_addr A pointer to the sockaddr_in structure representing the sender's address.
+ * 
+ * @return The number of bytes received on success, or -1 on error.
+ */
 int rudp_recv(RUDPConnection *connection, char *buffer, int buffer_size, struct sockaddr_in *sender_addr)
 {
     RUDPPacket packet;
@@ -270,8 +307,7 @@ int rudp_recv(RUDPConnection *connection, char *buffer, int buffer_size, struct 
         printf("packet sequence number: %u\n", packet.header.sequence_number);
         printf("valid_checksum: %d\n", valid_checksum);
         printf("packet DATA flag: %d\n", packet.header.flags.DATA);
-        // print packet data
-        // printf("packet data: %s\n", packet.data);
+        
         // if the checksum is valid
         if (packet.header.sequence_number == connection->next_sequence_number && packet.header.flags.DATA == 1 && valid_checksum == 1)
         {
@@ -303,8 +339,8 @@ int rudp_recv(RUDPConnection *connection, char *buffer, int buffer_size, struct 
     // create an ACK packet
     RUDPPacket ack_packet;
 
-    ack_packet.header.sequence_number = connection->next_sequence_number;
-    ack_packet.header.flags.ACK = 1;
+    ack_packet.header.sequence_number = connection->next_sequence_number;// set the sequence number
+    ack_packet.header.flags.ACK = 1;// set the ACK flag
     char *ack_massage = "ACK";
     printf("Sending ACK packet with checksum");
     memcpy(ack_packet.data, ack_massage, strlen(ack_massage));
@@ -317,11 +353,22 @@ int rudp_recv(RUDPConnection *connection, char *buffer, int buffer_size, struct 
     connection->next_sequence_number++;
     return bytes_received;
 }
-
+/**
+ * @brief Receives a FIN packet over a RUDP connection and sends a FIN-ACK packet in response.
+ * 
+ * This function waits for a FIN packet to be received over a Reliable UDP (RUDP) connection.
+ * Once a FIN packet is received, it sends a FIN-ACK packet back to the sender to acknowledge
+ * the termination request.
+ * 
+ * @param connection A pointer to the RUDPConnection structure representing the connection.
+ * 
+ * @return 0 on success, or -1 on error.
+ */
 int rudp_recv_fin(RUDPConnection *connection){
     RUDPPacket fin_packet;
     socklen_t sender_addr_len = sizeof(connection->sender_addr);
     int bytes_received;
+    //do - while until we get a FIN packet
     do{
         bytes_received = recvfrom(connection->sockfd, &fin_packet, sizeof(fin_packet), 0, (struct sockaddr *)&connection->sender_addr, &sender_addr_len);
         if (bytes_received < 0)
@@ -349,7 +396,17 @@ int rudp_recv_fin(RUDPConnection *connection){
     printf("Sending FIN_ACK packet with checksum: %u\n", fin_ack_packet.header.flags.FIN_ACK);
     return 0;
 }
-
+/**
+ * @brief Sends a FIN packet to terminate a RUDP connection.
+ * 
+ * This function sends a FIN (Finish) packet to the peer to indicate the termination
+ * of the Reliable UDP (RUDP) connection. It waits for a FIN-ACK (Finish Acknowledgment)
+ * packet from the peer to confirm the termination.
+ * 
+ * @param connection A pointer to the RUDPConnection structure representing the connection.
+ * 
+ * @return 0 on success, or -1 on error.
+ */
 int rudp_send_fin(RUDPConnection *connection){
     RUDPPacket fin_packet;
     fin_packet.header.flags.FIN = 1;
@@ -409,6 +466,19 @@ unsigned short int calculate_checksum(void *data, unsigned int bytes)
         total_sum = (total_sum & 0xFFFF) + (total_sum >> 16);
     return (~((unsigned short int)total_sum));
 }
+
+/**
+ * @brief Verifies the checksum of the given data.
+ * 
+ * This function calculates the checksum of the provided data and compares it with the received checksum.
+ * It uses a 16-bit checksum algorithm to ensure data integrity.
+ * 
+ * @param data A pointer to the data for which the checksum needs to be verified.
+ * @param bytes The length of the data in bytes.
+ * @param received_checksum The checksum received with the data that needs to be verified.
+ * 
+ * @return 1 if the checksum is valid, 0 otherwise.
+ */
 int verify_checksum(void *data, unsigned int bytes, unsigned short int received_checksum)
 {
     unsigned short int *data_pointer = (unsigned short int *)data;
