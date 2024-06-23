@@ -10,8 +10,11 @@
 #include <sys/time.h>
 
 #define MAX_RETRANSMISSION_COUNT 30
+#define PACKET_HISTORY_SIZE 10
 
-static int retransmission_count = 0;
+// Array to store the history of recently sent packets
+RUDPPacket packet_history[PACKET_HISTORY_SIZE];
+int history_index = 0;
 
 unsigned short int calculate_checksum(void *data, unsigned int bytes);
 
@@ -167,191 +170,156 @@ RUDPConnection *rudp_socket(struct sockaddr_in *receiver_addr, struct sockaddr_i
 /**
  * @brief Sends a data packet over a RUDP connection.
  * 
- * This function sends a data packet over a Reliable UDP (RUDP) connection. It handles
- * the creation of the packet, setting the sequence number, calculating the checksum,
- * and managing retransmissions in case of packet loss or errors.
+ * This function prepares and sends a data packet, then waits for an acknowledgment.
+ * It handles retransmissions if no ACK is received or if a NACK is received.
  * 
- * @param connection A pointer to the RUDPConnection structure representing the connection.
- * @param buffer A pointer to the data buffer to be sent.
- * @param buffer_size The size of the data buffer in bytes.
- * @param sender_addr A pointer to the sockaddr_in structure representing the sender's address.
+ * @param connection Pointer to the RUDPConnection structure.
+ * @param buffer Pointer to the data buffer to be sent.
+ * @param buffer_size Size of the data buffer in bytes.
+ * @param sender_addr Pointer to the sockaddr_in structure containing the sender's address.
  * 
- * @return The number of bytes sent on success, or -1 on error.
+ * @return Number of bytes sent on success, -1 on failure.
  */
 int rudp_send(RUDPConnection *connection, char *buffer, int buffer_size, struct sockaddr_in *sender_addr)
 {
     RUDPPacket packet;
-    // set a data size
-    packet.length = buffer_size;
+    packet.length = buffer_size;  // Set the packet length
+    memcpy(packet.data, buffer, buffer_size);  // Copy data to the packet
+    packet.header.sequence_number = connection->next_sequence_number;  // Set the sequence number
+    packet.header.checksum = calculate_checksum(&packet.data, sizeof(packet.data));  // Calculate the checksum
+    packet.header.flags.DATA = 1;  // Mark the packet as a data packet
 
-    // copy the data to the packet
-    memcpy(packet.data, buffer, buffer_size);
+    int max_retries = 5;  // Maximum number of retransmission attempts
+    int retry_count = 0;  // Current retry count
 
-    // set the sequence number
-    packet.header.sequence_number = connection->next_sequence_number;
-    // set the checksum
-    packet.header.checksum = calculate_checksum(&packet.data, sizeof(packet.data));
+    while (retry_count < max_retries) {
+        // Send the packet
+        int bytes_sent = sendto(connection->sockfd, &packet, sizeof(packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr));
+        if (bytes_sent < 0) {
+            perror("Error sending data packet");
+            return -1;
+        }
 
-    printf("Sending packet with checksum: %u\n", packet.header.checksum);
-    printf("Sending packet with sequence number: %u\n", packet.header.sequence_number);
-    // set the DATA flag
-    packet.header.flags.DATA = 1;
+        printf("Sent packet with sequence number: %u\n", packet.header.sequence_number);
 
-    // Buffer to store sent packets
-    RUDPPacket sent_packets[MAX_RETRANSMISSION_COUNT];
-    int sent_packet_count = 0;
+        // Store the packet in history
+        packet_history[history_index] = packet;
+        history_index = (history_index + 1) % PACKET_HISTORY_SIZE;
 
-    // send the packet
-    int bytes_sent = sendto(connection->sockfd, &packet, sizeof(packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr));
-    if (bytes_sent < 0)
-    {
-        perror("Error sending data packet");
-        return -1;
+        RUDPPacket ack_packet;
+        socklen_t sender_addr_len = sizeof(struct sockaddr_in);
+        
+        // Set timeout for receiving ACK
+        struct timeval tv;
+        tv.tv_sec = 1;  // 1 second timeout
+        tv.tv_usec = 0;
+        setsockopt(connection->sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+        // Try to receive ACK
+        int bytes_received = recvfrom(connection->sockfd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)sender_addr, &sender_addr_len);
+
+        if (bytes_received > 0 && ack_packet.header.flags.ACK == 1 && ack_packet.header.sequence_number == connection->next_sequence_number) {
+            // Received valid ACK
+            printf("Received ACK for packet %u\n", connection->next_sequence_number);
+            connection->next_sequence_number++;
+            return bytes_sent;
+        } else if (bytes_received > 0 && ack_packet.header.flags.NACK == 1) {
+            // Received NACK
+            printf("Received NACK for packet %u, expected %u\n", connection->next_sequence_number, ack_packet.header.sequence_number);
+            if (ack_packet.header.sequence_number < connection->next_sequence_number) {
+                // Receiver expects a lower sequence number, go back
+                for (int i = 0; i < PACKET_HISTORY_SIZE; i++) {
+                    if (packet_history[i].header.sequence_number == ack_packet.header.sequence_number) {
+                        packet = packet_history[i];  // Retrieve the old packet from history
+                        connection->next_sequence_number = ack_packet.header.sequence_number;
+                        retry_count = 0;  // Reset retry count
+                        break;
+                    }
+                }
+            }
+        } else {
+            // No response received
+            printf("No ACK received, retrying...\n");
+        }
+
+        retry_count++;
     }
 
-    sent_packets[sent_packet_count++] = packet;
-
-    // try to recive an ACK packet if not retransmit the packet again
-    RUDPPacket ack_packet;
-    socklen_t sender_addr_len = sizeof(struct sockaddr_in);
-    int bytes_received;
-
-    // do - while until we get an ACK packet
-    do
-    {
-        // try to receive an ACK packet
-        printf("Trying to receive ACK packet\n");
-        bytes_received = recvfrom(connection->sockfd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)sender_addr, &sender_addr_len);
-        if (bytes_received <= 0 || ack_packet.header.flags.NACK == 1 || ack_packet.header.sequence_number != connection->next_sequence_number)
-        {
-            printf("Error receiving ACK packet\n");
-            if (sendto(connection->sockfd, &packet, sizeof(packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr)) < 0)
-            {
-                perror("Error sending data packet");
-                return -1;
-            }
-            packet.retransmission_count++;
-            retransmission_count++;
-
-            if (packet.retransmission_count > MAX_RETRANSMISSION_COUNT)
-            {
-                printf("Max retransmissions reached\n");
-                return -1;
-            }
-        }
-        else// if the packet is valid
-        {
-            if (ack_packet.header.sequence_number == connection->next_sequence_number && ack_packet.header.flags.ACK == 1)
-            {
-                printf("Received ACK packet with checksum: %u\n", ack_packet.header.sequence_number);
-                break;
-            }
-        }
-
-    } while (ack_packet.header.sequence_number != connection->next_sequence_number);
-
-    // Remove the acknowledged packet from the buffer
-    for (int i = 0; i < sent_packet_count; i++)
-    {
-        if (sent_packets[i].header.sequence_number == ack_packet.header.sequence_number)
-        {
-            // Shift the remaining packets
-            for (int j = i; j < sent_packet_count - 1; j++)
-            {
-                sent_packets[j] = sent_packets[j + 1];
-            }
-            sent_packet_count--;
-            break;
-        }
-    }
-    // increment the next sequence number
-    connection->next_sequence_number++;
-    return bytes_sent;
+    printf("Max retries reached for packet %u\n", connection->next_sequence_number);
+    return -1;
 }
 /**
  * @brief Receives a data packet over a RUDP connection.
  * 
- * This function waits for a data packet to be received over a Reliable UDP (RUDP) connection.
- * It verifies the checksum and sequence number of the received packet, and sends a NACK packet
- * if the packet is invalid. If the packet is valid, it sends an ACK packet and copies the data
- * to the provided buffer.
+ * This function waits for and processes incoming packets. It handles in-order,
+ * out-of-order, and duplicate packets. It sends acknowledgments for received packets.
  * 
- * @param connection A pointer to the RUDPConnection structure representing the connection.
- * @param buffer A pointer to the buffer where the received data will be stored.
- * @param buffer_size The size of the buffer in bytes.
- * @param sender_addr A pointer to the sockaddr_in structure representing the sender's address.
+ * @param connection Pointer to the RUDPConnection structure.
+ * @param buffer Pointer to the buffer where received data will be stored.
+ * @param buffer_size Size of the receive buffer in bytes.
+ * @param sender_addr Pointer to the sockaddr_in structure to store the sender's address.
  * 
- * @return The number of bytes received on success, or -1 on error.
+ * @return Number of bytes received on success, -1 on failure.
  */
+
 int rudp_recv(RUDPConnection *connection, char *buffer, int buffer_size, struct sockaddr_in *sender_addr)
 {
     RUDPPacket packet;
     socklen_t sender_addr_len = sizeof(*sender_addr);
     int bytes_received;
     int valid_checksum;
-    // do - while until we get a DATA packet
-    do
-    {
+    uint16_t last_in_order_sequence = connection->next_sequence_number - 1;  // Last in-order sequence number received
+
+    while (1) {
+        // Receive a packet
         bytes_received = recvfrom(connection->sockfd, &packet, buffer_size, 0, (struct sockaddr *)sender_addr, &sender_addr_len);
-        if (bytes_received < 0)
-        {
+        if (bytes_received < 0) {
             perror("Error receiving data packet");
             return -1;
         }
-        // store the checksum of the packet
-        unsigned short int checksum = packet.header.checksum;
-        // set the checksum to 0
-        valid_checksum = verify_checksum(&packet.data, sizeof(packet.data), checksum);
+
+        // Verify checksum
+        valid_checksum = verify_checksum(&packet.data, sizeof(packet.data), packet.header.checksum);
         
-        printf("next_sequence_number: %u\n", connection->next_sequence_number);
-        printf("packet sequence number: %u\n", packet.header.sequence_number);
-        printf("valid_checksum: %d\n", valid_checksum);
-        printf("packet DATA flag: %d\n", packet.header.flags.DATA);
+        printf("Received packet with sequence number: %u, expected: %u\n", packet.header.sequence_number, connection->next_sequence_number);
         
-        // if the checksum is valid
-        if (packet.header.sequence_number == connection->next_sequence_number && packet.header.flags.DATA == 1 && valid_checksum == 1)
-        {
-            printf("Received packet with checksum: %u\n", packet.header.checksum);
-            printf("Received packet with sequence number: %u\n", packet.header.sequence_number);
-            break;
-        }
-        // if the checksum is not valid, we send a NACK packet
-        else
-        {
+        if (packet.header.sequence_number == connection->next_sequence_number && packet.header.flags.DATA == 1 && valid_checksum == 1) {
+            // Received valid packet in correct order
+            printf("Valid packet received\n");
+            memcpy(buffer, packet.data, packet.length);  // Copy data to buffer
+            
+            connection->next_sequence_number++;
+            last_in_order_sequence = packet.header.sequence_number;
+        } else if (packet.header.sequence_number < connection->next_sequence_number) {
+            // Received old packet
+            printf("Received old packet %u, expected %u. Sending ACK.\n", packet.header.sequence_number, connection->next_sequence_number);
+            RUDPPacket ack_packet;
+            ack_packet.header.sequence_number = packet.header.sequence_number;
+            ack_packet.header.flags.ACK = 1;
+            sendto(connection->sockfd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr));
+            continue;
+        } else if (packet.header.sequence_number > connection->next_sequence_number) {
+            // Received future packet
+            printf("Received future packet %u, expected %u. Sending NACK.\n", packet.header.sequence_number, connection->next_sequence_number);
             RUDPPacket nack_packet;
+            nack_packet.header.sequence_number = connection->next_sequence_number;
             nack_packet.header.flags.NACK = 1;
-            char *nack_massage = "NACK";
-            memcpy(nack_packet.data, nack_massage, strlen(nack_massage));
-            if (sendto(connection->sockfd, &nack_packet, sizeof(nack_packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr)) < 0)
-            {
-                perror("Error sending NACK packet");
-                return -1;
-            }
-            printf("Sending NACK packet with checksum: %u\n", nack_packet.header.flags.NACK);
-            //decrement the next sequence number
-            connection->next_sequence_number--;
+            sendto(connection->sockfd, &nack_packet, sizeof(nack_packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr));
+            continue;
         }
-        printf("waiting for packet\n");
-    } while (packet.header.sequence_number != connection->next_sequence_number || valid_checksum != 1 || packet.header.flags.DATA != 1);
 
-    // copy the data from the packet to the buffer
-    memcpy(buffer, packet.data, packet.length);
-    // create an ACK packet
-    RUDPPacket ack_packet;
+        // Send cumulative ACK
+        RUDPPacket cumulative_ack;
+        cumulative_ack.header.sequence_number = last_in_order_sequence;
+        cumulative_ack.header.flags.ACK = 1;
+        if (sendto(connection->sockfd, &cumulative_ack, sizeof(cumulative_ack), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr)) < 0) {
+            perror("Error sending ACK packet");
+            return -1;
+        }
+        printf("Sent ACK for packet %u\n", last_in_order_sequence);
 
-    ack_packet.header.sequence_number = connection->next_sequence_number;// set the sequence number
-    ack_packet.header.flags.ACK = 1;// set the ACK flag
-    char *ack_massage = "ACK";
-    printf("Sending ACK packet with checksum");
-    memcpy(ack_packet.data, ack_massage, strlen(ack_massage));
-    if (sendto(connection->sockfd, &ack_packet, sizeof(ack_packet), 0, (struct sockaddr *)sender_addr, sizeof(*sender_addr)) < 0)
-    {
-        perror("Error sending ACK packet");
-        return -1;
+        return packet.length;  // Return the length of received data
     }
-    // increment the next sequence number
-    connection->next_sequence_number++;
-    return bytes_received;
 }
 /**
  * @brief Receives a FIN packet over a RUDP connection and sends a FIN-ACK packet in response.
@@ -370,6 +338,7 @@ int rudp_recv_fin(RUDPConnection *connection){
     int bytes_received;
     //do - while until we get a FIN packet
     do{
+        // Receive a FIN packet
         bytes_received = recvfrom(connection->sockfd, &fin_packet, sizeof(fin_packet), 0, (struct sockaddr *)&connection->sender_addr, &sender_addr_len);
         if (bytes_received < 0)
         {
